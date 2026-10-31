@@ -109,6 +109,22 @@ lazy_static::lazy_static! {
 
 const NUM_CHARS: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
+/// RTDESK: every ID is this prefix and 9 digits ("MA482913057"), so the server can tell an RTDESK
+/// install from any other RustDesk client.
+pub const RTDESK_ID_PREFIX: &str = "MA";
+const RTDESK_ID_DIGITS: usize = 9;
+
+/// Whether `id` has the RTDESK form: the prefix, then exactly 9 digits.
+pub fn is_rtdesk_id(id: &str) -> bool {
+    id.len() == RTDESK_ID_PREFIX.len() + RTDESK_ID_DIGITS
+        && id.starts_with(RTDESK_ID_PREFIX)
+        && id[RTDESK_ID_PREFIX.len()..].bytes().all(|b| b.is_ascii_digit())
+}
+
+fn rtdesk_id(number: u64) -> String {
+    format!("{}{}", RTDESK_ID_PREFIX, 100_000_000 + number % 900_000_000)
+}
+
 const CHARS: &[char] = &[
     '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k',
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
@@ -1046,25 +1062,24 @@ impl Config {
     fn get_auto_id() -> Option<String> {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
-            return Some(
-                rand::thread_rng()
-                    .gen_range(1_000_000_000..2_000_000_000)
-                    .to_string(),
-            );
+            return Some(rtdesk_id(rand::thread_rng().gen()));
         }
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            let mut id = 0u32;
+            // RTDESK: still derived from the MAC address, so the service and the UI process (both
+            // call get_id()) land on the same ID, but mixed so it is not the stock RustDesk number.
             if let Ok(Some(ma)) = mac_address::get_mac_address() {
-                for x in &ma.bytes()[2..] {
-                    id = (id << 8) | (*x as u32);
+                let mut mac = 0u64;
+                for x in ma.bytes() {
+                    mac = (mac << 8) | (x as u64);
                 }
-                id &= 0x1FFFFFFF;
+                let mixed = (mac ^ 0x5254_4445_534B).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let id = rtdesk_id(mixed >> 16);
                 log::info!("Generated id {}", id);
-                Some(id.to_string())
+                Some(id)
             } else {
-                None
+                Some(rtdesk_id(rand::thread_rng().gen()))
             }
         }
     }
@@ -1199,8 +1214,13 @@ impl Config {
 
     pub fn get_id() -> String {
         let mut id = CONFIG.read().unwrap().id.clone();
-        if id.is_empty() {
-            if let Some(tmp) = Config::gen_id() {
+        // RTDESK: an ID of any other form (a stock RustDesk number from an earlier install) is
+        // replaced by a new RTDESK one.
+        if id.is_empty() || !is_rtdesk_id(&id) {
+            if let Some(tmp) = Config::gen_id().filter(|x| is_rtdesk_id(x)) {
+                if !id.is_empty() {
+                    log::info!("id {} replaced by the RTDESK id {}", id, tmp);
+                }
                 id = tmp;
                 Config::set_id(&id);
             }
@@ -1277,7 +1297,7 @@ impl Config {
         // to-do: how about if one ip register a lot of ids?
         let id = Self::get_id();
         let mut rng = rand::thread_rng();
-        let new_id = rng.gen_range(1_000_000_000..2_000_000_000).to_string();
+        let new_id = rtdesk_id(rng.gen());
         Config::set_id(&new_id);
         log::info!("id updated from {} to {}", id, new_id);
     }
@@ -2941,6 +2961,20 @@ mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rtdesk_ids_are_ma_and_nine_digits() {
+        for n in [0u64, 1, 899_999_999, 900_000_000, u64::MAX] {
+            let id = rtdesk_id(n);
+            assert!(is_rtdesk_id(&id), "{}", id);
+            assert_eq!(id.len(), 11);
+        }
+        assert!(is_rtdesk_id("MA482913057"));
+        for bad in ["482913057", "1482913057", "ma482913057", "MA48291305", "MA4829130570", "MA48291305x"] {
+            assert!(!is_rtdesk_id(bad), "{}", bad);
+        }
+        assert!(Config::get_auto_id().map_or(true, |id| is_rtdesk_id(&id)));
+    }
 
     struct ConfigStateTestGuard {
         original_config: Config,
